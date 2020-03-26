@@ -159,7 +159,8 @@ _kong()
   kubectl -n kong rollout status deploy/kong-kong
 }
 
-function _registry() {
+_registry()
+{
   check_insecure_settings
   [ "$KUBE_ENGINE" = "k3s" ] && k3s_config
   # waiting for started system
@@ -180,7 +181,8 @@ Registry:
 EOF
 }
 
-function _exlb() {
+_exlb()
+{
   NGINX_CONF=$(git_root_dir)/run/nginx.conf
   nginx-lb-conf > $NGINX_CONF
   docker container rm --force nginx-lb || true
@@ -189,7 +191,8 @@ function _exlb() {
   docker run -d --sysctl net.ipv4.ip_nonlocal_bind=1 --name nginx-lb --restart=always -p 80:80 -p 443:443 -v $(git_root_dir)/run/nginx.conf:/etc/nginx/nginx.conf nginx:1.14
 }
 
-function _test() {
+_test()
+{
   NODE_IP=$(kubectl get nodes --namespace default -o jsonpath="{.items[0].status.addresses[0].address}")
   NODE_PORT=$(kubectl get --namespace default -o jsonpath="{.spec.ports[0].nodePort}" services docker-registry)
   REPO=$NODE_IP:$NODE_PORT
