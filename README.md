@@ -49,7 +49,7 @@ Commands:
   test       for private registry
   terminate  purge all vms
 
-Flags: valid only for vms command
+Flags: valid only for cluster command
   -c         cpu (default: 2)
   -m         memory (default: 4)
   -d         disk (default: 5)
