@@ -1,4 +1,4 @@
-# Launch k3s cluster on MacOS
+# Launch a k3s cluster on MacOS
 
 ## Preparing
 ```bash
