@@ -92,6 +92,32 @@ runcmd:
 EOF
 }
 
+_check_insecure_settings()
+{
+  if [ ! -f ${HOME}/.docker/daemon.json ] || [ -z "$(docker system info --format '{{json .RegistryConfig.InsecureRegistryCIDRs}}' | jq -r '.[] | select(test("192.168.64.0/24"))')" ]
+  then
+    cat <<EOB
+
+# added insecure-registries
+cat <<EOF > ${HOME}/.docker/daemon.json
+{
+  "experimental" : false,
+  "debug" : true,
+  "insecure-registries" : [
+    "192.168.64.0/24"
+  ]
+}
+EOF
+
+# Restart or Start docker daemon
+# MacOS: http://osxdaily.com/2014/09/05/gracefully-quit-application-command-line/
+osascript -e 'quit app "Docker"' && open -a Docker
+
+EOB
+    exit 1
+  fi
+}
+
 # sub commands
 _cluster()
 {
@@ -161,7 +187,7 @@ _kong()
 
 _registry()
 {
-  check_insecure_settings
+  _check_insecure_settings
   [ "$KUBE_ENGINE" = "k3s" ] && k3s_config
   # waiting for started system
   kubectl rollout status deployment tiller-deploy -n kube-system
