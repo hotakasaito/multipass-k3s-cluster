@@ -33,6 +33,13 @@ EOF
   exit 2
 }
 
+_signal_handler()
+{
+    test -e /tmp/$UBUNTU_IMAGE && rm -f /tmp/$UBUNTU_IMAGE
+}
+
+trap _signal_handler 1 2 3 15
+
 _git_root_dir()
 {
   pushd ${0%/*} > /dev/null
@@ -74,6 +81,10 @@ _setup()
   then
     curl -sfSL https://dl.k8s.io/${KUBECTL_VERSION}/kubernetes-client-darwin-amd64.tar.gz | tar xvzf - -C /usr/local/bin --strip=3 - kubernetes/client/bin/kubectl
   fi
+
+  test -x /usr/local/opt/curl/bin/curl && {
+      alias curl=/usr/local/opt/curl/bin/curl
+  }
 }
 
 _k3s_master_cloud_init()
@@ -126,6 +137,9 @@ _cluster()
 {
   NODES="$(eval "echo node{1..$NODE}")"
   MASTER_NODE=node1
+  test -e /tmp/${UBUNTU_IMAGE} || {
+      curl -L -o /tmp/${UBUNTU_IMAGE} http://ubuntutym2.u-toyama.ac.jp/cloud-images/releases/18.04/release/${UBUNTU_IMAGE}
+  }
 
   for node in ${NODES}
   do
@@ -135,8 +149,7 @@ _cluster()
     if [ $node = "$MASTER_NODE" ]
     then
 #      multipass launch --name ${node} --cpus ${MASTER_CPU} --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
-      curl -L -o /tmp/ubuntu-18.04-server-cloudimg-amd64.img http://cloud-images.ubuntu.com/releases/server/releases/bionic/release-20200218/ubuntu-18.04-server-cloudimg-amd64.img
-      multipass launch --name ${node} --cpus ${MASTER_CPU} --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init) /tmp/ubuntu-18.04-server-cloudimg-amd64.img
+      multipass launch --name ${node} --cpus ${MASTER_CPU} --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init) /tmp/${UBUNTU_IMAGE}
       multipass exec ${node} -- /bin/bash -c 'while [[ $(k3s kubectl get nodes $(hostname) --no-headers 2>/dev/null | grep -c -w "Ready") -ne 1 ]]; do echo -n .; sleep 3; done; echo' < /dev/null
 
       K3S_NODEIP_MASTER="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
@@ -146,7 +159,7 @@ _cluster()
     else
       K3S_TOKEN="$(multipass exec $MASTER_NODE -- /bin/bash -c "sudo cat /var/lib/rancher/k3s/server/node-token" < /dev/null)"
       K3S_URL="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
-      multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init <(_k3s_worker_cloud_init)
+      multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init <(_k3s_worker_cloud_init) /tmp/${UBUNTU_IMAGE}
     fi
 
     multipass exec ${node} -- sudo sed -i -e 's/^#\?DNS=.*/DNS=1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4/' /etc/systemd/resolved.conf
@@ -255,6 +268,7 @@ _terminate()
 # vars
 LANG=C
 MULTIPASS_VER=1.1.0
+UBUNTU_IMAGE=ubuntu-18.04-server-cloudimg-amd64.img
 CERT_MANAGER_VER=0.12.0
 MASTER_CPU=1
 MASTER_MEM=1
