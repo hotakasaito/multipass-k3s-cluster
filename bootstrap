@@ -6,7 +6,7 @@ _usage()
 {
   cat <<EOF
 Usage:
-  ${0##*/} -h [-c|-m|-d|-n num] (all|cluster|helm|cert|kong|registry|exlb|test|terminate)
+  ${0##*/} -v -h [-c|-m|-d|-n num] (all|cluster|helm|cert|kong|registry|exlb|test|terminate)
 
 Commands:
   all        all
@@ -18,6 +18,9 @@ Commands:
   exlb       external loadbalancer on docker
   test       for private registry
   terminate  purge all vms
+
+Flags:
+  -v         debug
 
 Flags: valid only for cluster command
   -c         cpu (default: $CPU)
@@ -131,7 +134,9 @@ _cluster()
     }
     if [ $node = "$MASTER_NODE" ]
     then
-      multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
+#      multipass launch --name ${node} --cpus ${MASTER_CPU} --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
+      curl -L -o /tmp/ubuntu-18.04-server-cloudimg-amd64.img http://cloud-images.ubuntu.com/releases/server/releases/bionic/release-20200218/ubuntu-18.04-server-cloudimg-amd64.img
+      multipass launch --name ${node} --cpus ${MASTER_CPU} --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init) /tmp/ubuntu-18.04-server-cloudimg-amd64.img
       multipass exec ${node} -- /bin/bash -c 'while [[ $(k3s kubectl get nodes $(hostname) --no-headers 2>/dev/null | grep -c -w "Ready") -ne 1 ]]; do echo -n .; sleep 3; done; echo' < /dev/null
 
       K3S_NODEIP_MASTER="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
@@ -262,9 +267,12 @@ KUBECTL_VERSION=v1.17.0
 export KUBECONFIG=$(_git_root_dir)/run/k3s.yaml
 
 # main
-while getopts "c:m:d:n:h" option
+while getopts "vc:m:s:n:h" option
 do
   case "$option" in
+    v)
+      set -x
+      ;;
     c)
       CPU=$OPTARG
       ;;
