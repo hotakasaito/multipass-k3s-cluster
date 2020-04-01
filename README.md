@@ -32,7 +32,7 @@ To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
 $ ./bootstrap terminate
 ```
 
-## Help
+## Usage
 ```bash
 $ ./bootstrap -h
 Usage:
