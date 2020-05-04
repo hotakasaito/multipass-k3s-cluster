@@ -38,6 +38,7 @@ Flags: valid only for cluster command
   -m         memory (default: $MEM)
   -d         disk (default: $DISK)
   -n         node (default: $NODE)
+  -s         for slow network
 
 EOF
   exit 2
@@ -96,23 +97,91 @@ _setup()
   multipass set client.gui.autostart=false
 }
 
+_cloudimg_cache()
+{
+  parallel sudo aria2c -x5 -d /var/root/Library/Caches/multipassd/vault/images/bionic-20200407/ ::: \
+           http://ubuntutym2.u-toyama.ac.jp/cloud-images/releases/18.04/release/unpacked/ubuntu-18.04-server-cloudimg-amd64-initrd-generic \
+           http://ubuntutym2.u-toyama.ac.jp/cloud-images/releases/18.04/release/unpacked/ubuntu-18.04-server-cloudimg-amd64-vmlinuz-generic \
+           http://ubuntutym2.u-toyama.ac.jp/cloud-images/releases/18.04/release/ubuntu-18.04-server-cloudimg-amd64.img
+  cat <<EOF | sudo tee /var/root/Library/Caches/multipassd/vault/multipassd-image-records.json
+{
+    "2f6bc5e7d9acfea8f5bd72893d2faa037b908a1e75d54f2ab8deb0f3da045d00": {
+        "image": {
+            "aliases": [
+                {
+                    "alias": "18.04"
+                },
+                {
+                    "alias": "b"
+                },
+                {
+                    "alias": "bionic"
+                },
+                {
+                    "alias": "default"
+                },
+                {
+                    "alias": "lts"
+                },
+                {
+                    "alias": "ubuntu"
+                }
+            ],
+            "current_release": "",
+            "id": "2f6bc5e7d9acfea8f5bd72893d2faa037b908a1e75d54f2ab8deb0f3da045d00",
+            "initrd_path": "/var/root/Library/Caches/multipassd/vault/images/bionic-20200407/ubuntu-18.04-server-cloudimg-amd64-initrd-generic",
+            "kernel_path": "/var/root/Library/Caches/multipassd/vault/images/bionic-20200407/ubuntu-18.04-server-cloudimg-amd64-vmlinuz-generic",
+            "original_release": "18.04 LTS",
+            "path": "/var/root/Library/Caches/multipassd/vault/images/bionic-20200407/ubuntu-18.04-server-cloudimg-amd64.img",
+            "release_date": "20200407"
+        },
+        "last_accessed": 1588325657355804,
+        "query": {
+            "persistent": false,
+            "query_type": 0,
+            "release": "default",
+            "remote_name": ""
+        }
+    }
+}
+EOF
+}
+
 _k3s_master_cloud_init()
 {
   EXTERNAL_IP=$(ip route get www.google.com | awk '{print $NF}')
-  cat << EOF
+  case "$1" in
+    command)
+      cat <<EOF
+curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy servicelb --no-deploy traefik --no-deploy metrics-server --no-flannel --tls-san ${EXTERNAL_IP}
+EOF
+      ;;
+    *)
+      cat << EOF
 #cloud-config
 runcmd:
  - '\curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy servicelb --no-deploy traefik --no-deploy metrics-server --no-flannel --tls-san ${EXTERNAL_IP}'
 EOF
+      ;;
+    esac
 }
 
 _k3s_worker_cloud_init()
 {
-  cat << EOF
+  case "$1" in
+    command)
+      cat <<EOF
+curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} K3S_URL=${K3S_URL} sh -s -
+EOF
+      ;;
+    *)
+      cat << EOF
 #cloud-config
 runcmd:
  - '\curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} K3S_URL=${K3S_URL} sh -s -'
 EOF
+      ;;
+  esac
 }
 
 _check_insecure_settings()
@@ -150,6 +219,8 @@ _cluster()
       curl -L -o /tmp/${UBUNTU_IMAGE} http://ubuntutym2.u-toyama.ac.jp/cloud-images/releases/18.04/release/${UBUNTU_IMAGE}
   }
 
+  $SLOW_NETWORK && (test -e /var/root/Library/Caches/multipassd/vault/images/bionic-20200407/ubuntu-18.04-server-cloudimg-amd64.img || _cloudimg_cache)
+
   for node in ${NODES}
   do
     multipass info ${node} > /dev/null 2>&1 && {
@@ -160,7 +231,13 @@ _cluster()
 
       # til multipass v1.1.0
       #multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
-      _k3s_master_cloud_init | multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init -
+      if $SLOW_NETWORK
+      then
+        multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G
+        multipass exec ${node} -- /bin/bash -c "$(_k3s_master_cloud_init command)"
+      else
+        _k3s_master_cloud_init | multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init -
+      fi
 
       multipass exec ${node} -- /bin/bash -c 'while [[ $(k3s kubectl get nodes $(hostname) --no-headers 2>/dev/null | grep -c -w "Ready") -ne 1 ]]; do echo -n .; sleep 3; done; echo' < /dev/null
 
@@ -173,7 +250,13 @@ _cluster()
 
       # til multipass v1.1.0
       #multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init <(_k3s_worker_cloud_init)
-      _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init -
+      if $SLOW_NETWORK
+      then
+        _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G
+        multipass exec ${node} -- $(_k3s_worker_cloud_init command)
+      else
+        _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init -
+      fi
     fi
 
     multipass exec ${node} -- sudo sed -i -e 's/^#\?DNS=.*/DNS=8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1/' /etc/systemd/resolved.conf
@@ -291,15 +374,13 @@ MEM=4
 DISK=5
 NODE=3
 KUBECTL_VERSION=v1.17.0
+SLOW_NETWORK=false
 export KUBECONFIG=$(_git_root_dir)/run/k3s.yaml
 
 # main
-while getopts "c:m:d:n:vh" option
+while getopts "c:m:d:n:svh" option
 do
   case "$option" in
-    v)
-      set -x
-      ;;
     c)
       CPU=$OPTARG
       ;;
@@ -311,6 +392,9 @@ do
       ;;
     n)
       NODE=$OPTARG
+      ;;
+    s)
+      SLOW_NETWORK=true
       ;;
     v)
       set -evxET
