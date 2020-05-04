@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+
+set -eo pipefail
+
+_clean()
+{
+  for file in /tmp/master-cloud-init.$$ /tmp/worker-cloud-init.$$
+  do
+    test -e $file && rm -f $file
+  done
+}
+
+trap '_clean ; exit 1' 1 2 3 15
+
+_usage()
+{
+  cat <<EOF
+Usage:
+  ${0##*/} -v -h [-c|-m|-d|-n num] (all|cluster|helm|cert|kong|registry|exlb|test|terminate)
+
+Commands:
+  all        all
+  cluster    install k3s cluster
+  helm       helm setup
+  cert       install cert-manager
+  kong       load balancer
+  registry   private registry
+  exlb       external loadbalancer on docker
+  test       for private registry
+  terminate  purge all vms
+
+Flags:
+  -v         verbose mode
+  -h         show this message
+
+Flags: valid only for cluster command
+  -c         cpu (default: $CPU)
+  -m         memory (default: $MEM)
+  -d         disk (default: $DISK)
+  -n         node (default: $NODE)
+
+EOF
+  exit 2
+}
+
+_signal_handler()
+{
+    test -e /tmp/$UBUNTU_IMAGE && rm -f /tmp/$UBUNTU_IMAGE
+}
+
+trap _signal_handler 1 2 3 15
+
+_git_root_dir()
+{
+  pushd ${0%/*} > /dev/null
+  GIT_ROOT_DIR=$(git rev-parse --show-toplevel)
+  popd > /dev/null
+  echo $GIT_ROOT_DIR
+}
+
+_check_multipass()
+{
+  brew cask list multipass > /dev/null 2>&1 && brew cask uninstall multipass
+  which multipass > /dev/null && (multipass version | grep -E "^multipass\s+${MULTIPASS_VER}" > /dev/null) && return
+
+  pushd /tmp
+  case $MULTIPASS_VER in
+    1.*.*)
+      curl -sfS -LO https://github.com/canonical/multipass/releases/download/v${MULTIPASS_VER}/multipass-${MULTIPASS_VER}+mac-Darwin.pkg
+      ;;
+    0.8.*)
+      curl -sfS -LO https://github.com/CanonicalLtd/multipass/releases/download/v${MULTIPASS_VER}/multipass-${MULTIPASS_VER}+mac-Darwin.pkg
+      ;;
+    *)
+      curl -sfS -LO https://github.com/CanonicalLtd/multipass/releases/download/v${MULTIPASS_VER}/multipass-${MULTIPASS_VER}+mac-Darwin-unsigned.pkg
+      ;;
+  esac
+  sudo installer -store -pkg "/tmp/multipass-${MULTIPASS_VER}+mac-Darwin.pkg" -target /
+  popd
+}
+
+_setup()
+{
+  test -d $(_git_root_dir)/run || mkdir $(_git_root_dir)/run
+  for c in jq helm stern iproute2mac aria2 parallel
+  do
+    brew list $c > /dev/null 2>&1 || brew install $c
+  done
+
+  if [ ! -x /usr/local/bin/kubectl ] || [ "$(/usr/local/bin/kubectl version --client -o json | jq -r .clientVersion.gitVersion)" != $KUBECTL_VERSION ]
+  then
+    curl -sfSL https://dl.k8s.io/${KUBECTL_VERSION}/kubernetes-client-darwin-amd64.tar.gz | tar xvzf - -C /usr/local/bin --strip=3 - kubernetes/client/bin/kubectl
+  fi
+
+  # multipass
+  multipass set client.gui.autostart=false
+}
+
+_k3s_master_cloud_init()
+{
+  EXTERNAL_IP=$(ip route get www.google.com | awk '{print $NF}')
+  cat << EOF
+#cloud-config
+runcmd:
+ - '\curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy servicelb --no-deploy traefik --no-deploy metrics-server --no-flannel --tls-san ${EXTERNAL_IP}'
+EOF
+}
+
+_k3s_worker_cloud_init()
+{
+  cat << EOF
+#cloud-config
+runcmd:
+ - '\curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} K3S_URL=${K3S_URL} sh -s -'
+EOF
+}
+
+_check_insecure_settings()
+{
+  if [ ! -f ${HOME}/.docker/daemon.json ] || [ -z "$(docker system info --format '{{json .RegistryConfig.InsecureRegistryCIDRs}}' | jq -r '.[] | select(test("192.168.64.0/24"))')" ]
+  then
+    cat <<EOB
+
+# added insecure-registries
+cat <<EOF > ${HOME}/.docker/daemon.json
+{
+  "experimental" : false,
+  "debug" : true,
+  "insecure-registries" : [
+    "192.168.64.0/24"
+  ]
+}
+EOF
+
+# Restart or Start docker daemon
+# MacOS: http://osxdaily.com/2014/09/05/gracefully-quit-application-command-line/
+osascript -e 'quit app "Docker"' && open -a Docker
+
+EOB
+    exit 1
+  fi
+}
+
+# sub commands
+_cluster()
+{
+  NODES="$(eval "echo node{1..$NODE}")"
+  MASTER_NODE=node1
+  test -e /tmp/${UBUNTU_IMAGE} || {
+      curl -L -o /tmp/${UBUNTU_IMAGE} http://ubuntutym2.u-toyama.ac.jp/cloud-images/releases/18.04/release/${UBUNTU_IMAGE}
+  }
+
+  for node in ${NODES}
+  do
+    multipass info ${node} > /dev/null 2>&1 && {
+      continue
+    }
+    if [ $node = "$MASTER_NODE" ]
+    then
+
+      # til multipass v1.1.0
+      #multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
+      _k3s_master_cloud_init | multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init -
+
+      multipass exec ${node} -- /bin/bash -c 'while [[ $(k3s kubectl get nodes $(hostname) --no-headers 2>/dev/null | grep -c -w "Ready") -ne 1 ]]; do echo -n .; sleep 3; done; echo' < /dev/null
+
+      K3S_NODEIP_MASTER="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
+      multipass transfer ${MASTER_NODE}:/etc/rancher/k3s/k3s.yaml $(_git_root_dir)/run/k3s.yaml
+      sed -i'.back' -e s,https://127.0.0.1:6443,${K3S_NODEIP_MASTER},g $(_git_root_dir)/run/k3s.yaml
+    else
+      K3S_TOKEN="$(multipass exec $MASTER_NODE -- /bin/bash -c "sudo cat /var/lib/rancher/k3s/server/node-token" < /dev/null)"
+      K3S_URL="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
+
+      # til multipass v1.1.0
+      #multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init <(_k3s_worker_cloud_init)
+      _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init -
+    fi
+
+    multipass exec ${node} -- sudo sed -i -e 's/^#\?DNS=.*/DNS=8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1/' /etc/systemd/resolved.conf
+    multipass exec ${node} -- sudo systemctl restart systemd-resolved
+    multipass exec ${node} -- systemd-resolve --status
+    multipass exec ${node} -- sudo iptables -P FORWARD ACCEPT
+  done
+}
+
+_helm()
+{
+  kubectl -n kube-system get serviceaccount tiller > /dev/null 2>&1 || {
+    kubectl -n kube-system create serviceaccount tiller
+    kubectl create clusterrolebinding tiller --clusterrole=cluster-admin --serviceaccount=kube-system:tiller
+  }
+  curl -sfSL https://git.io/get_helm.sh | sh -
+  helm init --service-account tiller
+  kubectl rollout status deployment tiller-deploy -n kube-system
+}
+
+_cert()
+{
+  kubectl apply -f https://raw.githubusercontent.com/jetstack/cert-manager/release-0.9/deploy/manifests/00-crds.yaml
+  kubectl create namespace cert-manager
+  kubectl label namespace cert-manager certmanager.k8s.io/disable-validation=true
+  helm repo add jetstack https://charts.jetstack.io
+  helm repo update
+  helm install \
+       --name cert-manager \
+       --namespace cert-manager \
+       --version v$CERT_MANAGER_VER \
+       jetstack/cert-manager
+  kubectl -n cert-manager rollout status deploy/cert-manager
+}
+
+_kong()
+{
+  EXTERNAL_IP=$(ip route get www.google.com | awk '{print $NF}')
+  local conf=$(_git_root_dir)/config/kong-values-latest.yaml
+  helm install stable/kong --name kong --namespace kong -f $conf --set proxy.externalIPs[0]=$EXTERNAL_IP
+  kubectl -n kong rollout status deploy/kong-kong
+}
+
+_registry()
+{
+  _check_insecure_settings
+  [ "$KUBE_ENGINE" = "k3s" ] && k3s_config
+  # waiting for started system
+  kubectl rollout status deployment tiller-deploy -n kube-system
+
+  helm install stable/docker-registry --wait --name docker-registry --set service.type=NodePort,service.nodePort=${REGISTRY_NODE_PORT}
+  PASSWORD=$(kubectl get secret docker-registry-secret --output="jsonpath={.data.haSharedSecret}" | base64 -D)
+
+  export NODE_PORT=$(kubectl get --namespace default -o jsonpath="{.spec.ports[0].nodePort}" services docker-registry)
+  export NODE_IP=$(kubectl get nodes --namespace default -o jsonpath="{.items[0].status.addresses[0].address}")
+
+  echo $PASSWORD | docker login --username admin --password-stdin $NODE_IP:$NODE_PORT
+  cat <<EOF
+Registry:
+  User: admin
+  Pass: $PASSWORD
+  Repo: $NODE_IP:$NODE_PORT
+EOF
+}
+
+_exlb()
+{
+  NGINX_CONF=$(git_root_dir)/run/nginx.conf
+  nginx-lb-conf > $NGINX_CONF
+  docker container rm --force nginx-lb || true
+  # `--sysctl net.ipv4.ip_nonlocal_bind=1`は不要
+  # https://stackoverflow.com/questions/3191509/nginx-error-99-cannot-assign-requested-address
+  docker run -d --sysctl net.ipv4.ip_nonlocal_bind=1 --name nginx-lb --restart=always -p 80:80 -p 443:443 -v $(git_root_dir)/run/nginx.conf:/etc/nginx/nginx.conf nginx:1.17
+}
+
+_test()
+{
+  NODE_IP=$(kubectl get nodes --namespace default -o jsonpath="{.items[0].status.addresses[0].address}")
+  NODE_PORT=$(kubectl get --namespace default -o jsonpath="{.spec.ports[0].nodePort}" services docker-registry)
+  REPO=$NODE_IP:$NODE_PORT
+
+  docker pull nginx:alpine
+  docker tag nginx:alpine ${REPO}/test/nginx:alpine
+  docker push ${REPO}/test/nginx:alpine
+
+  kubectl run --namespace default nginx-test --image=${REPO}/test/nginx:alpine
+  kubectl rollout status deployment --namespace default nginx-test
+  kubectl get --namespace default all
+  kubectl delete --namespace default deployment.apps/nginx-test
+
+  docker image rm nginx:alpine ${REPO}/test/nginx:alpine
+}
+
+_terminate()
+{
+  for node in $(multipass list --format json | jq -r .list[].name | sort)
+  do
+    multipass exec $node -- sudo /bin/bash -c "test /usr/local/bin/k3s-uninstall.sh && /usr/local/bin/k3s-uninstall.sh || true"
+  done
+  rm -f $(_git_root_dir)/run/k3s.yaml*
+
+  multipass stop --all || true
+  multipass delete --purge --all || true
+}
+
+# vars
+LANG=C
+MULTIPASS_VER=1.2.0
+CERT_MANAGER_VER=0.12.0
+MASTER_CPU=1
+MASTER_MEM=1
+MASTER_DISK=1
+CPU=2
+MEM=4
+DISK=5
+NODE=3
+KUBECTL_VERSION=v1.17.0
+export KUBECONFIG=$(_git_root_dir)/run/k3s.yaml
+
+# main
+while getopts "c:m:d:n:vh" option
+do
+  case "$option" in
+    v)
+      set -x
+      ;;
+    c)
+      CPU=$OPTARG
+      ;;
+    m)
+      MEM=$OPTARG
+      ;;
+    d)
+      DISK=$OPTARG
+      ;;
+    n)
+      NODE=$OPTARG
+      ;;
+    v)
+      set -evxET
+      ;;
+    h)
+      _usage
+      ;;
+    *)
+      _usage
+      ;;
+  esac
+done
+
+shift `expr ${OPTIND} - 1`
+
+case "$1" in
+  all)
+    _check_multipass
+    _setup
+    _cluster
+    _helm
+    _cert
+    _kong
+    _registry
+    _exlb
+    _test
+    ;;
+  cluster)
+    _check_multipass
+    _setup
+    _cluster
+    ;;
+  helm)
+    _helm
+    ;;
+  cert)
+    _cert
+    ;;
+  kong)
+    _kong
+    ;;
+  registry)
+    _registry
+    ;;
+  exlb)
+    _exlb
+    ;;
+  test)
+    _test
+    ;;
+  terminate)
+    _terminate
+    ;;
+  *)
+    _usage
+    ;;
+esac
