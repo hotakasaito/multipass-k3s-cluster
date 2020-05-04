@@ -151,9 +151,14 @@ _k3s_master_cloud_init()
 {
   EXTERNAL_IP=$(ip route get www.google.com | awk '{print $NF}')
   case "$1" in
+    local)
+      cat <<EOF
+cat /tmp/k3s-install.sh | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy traefik --no-deploy metrics-server --tls-san ${EXTERNAL_IP}
+EOF
+      ;;
     command)
       cat <<EOF
-curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy servicelb --no-deploy traefik --no-deploy metrics-server --no-flannel --tls-san ${EXTERNAL_IP}
+curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy traefik --no-deploy metrics-server --tls-san ${EXTERNAL_IP}
 EOF
       ;;
     *)
@@ -169,6 +174,11 @@ EOF
 _k3s_worker_cloud_init()
 {
   case "$1" in
+    local)
+      cat <<EOF
+cat /tmp/k3s-install.sh | K3S_TOKEN=${K3S_TOKEN} K3S_URL=${K3S_URL} sh -s -
+EOF
+      ;;
     command)
       cat <<EOF
 curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} K3S_URL=${K3S_URL} sh -s -
@@ -219,7 +229,7 @@ _cluster()
       curl -L -o /tmp/${UBUNTU_IMAGE} http://ubuntutym2.u-toyama.ac.jp/cloud-images/releases/18.04/release/${UBUNTU_IMAGE}
   }
 
-  $SLOW_NETWORK && (test -e /var/root/Library/Caches/multipassd/vault/images/bionic-20200407/ubuntu-18.04-server-cloudimg-amd64.img || _cloudimg_cache)
+  $SLOW_NETWORK && (sudo test -e /var/root/Library/Caches/multipassd/vault/images/bionic-20200407/ubuntu-18.04-server-cloudimg-amd64.img || _cloudimg_cache)
 
   for node in ${NODES}
   do
@@ -234,7 +244,8 @@ _cluster()
       if $SLOW_NETWORK
       then
         multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G
-        multipass exec ${node} -- /bin/bash -c "$(_k3s_master_cloud_init command)"
+        multipass transfer $(_git_root_dir)/k3s-install.sh ${node}:/tmp
+        multipass exec ${node} -- /bin/bash -c "$(_k3s_master_cloud_init local)"
       else
         _k3s_master_cloud_init | multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init -
       fi
@@ -253,7 +264,8 @@ _cluster()
       if $SLOW_NETWORK
       then
         _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G
-        multipass exec ${node} -- $(_k3s_worker_cloud_init command)
+        multipass transfer $(_git_root_dir)/k3s-install.sh ${node}:/tmp
+        multipass exec ${node} -- /bin/bash -c "$(_k3s_worker_cloud_init local)"
       else
         _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init -
       fi
@@ -367,8 +379,8 @@ LANG=C
 MULTIPASS_VER=1.2.0
 CERT_MANAGER_VER=0.12.0
 MASTER_CPU=1
-MASTER_MEM=1
-MASTER_DISK=1
+MASTER_MEM=2
+MASTER_DISK=2
 CPU=2
 MEM=4
 DISK=5
