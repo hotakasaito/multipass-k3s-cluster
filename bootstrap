@@ -43,6 +43,13 @@ EOF
   exit 2
 }
 
+_signal_handler()
+{
+    test -e /tmp/$UBUNTU_IMAGE && rm -f /tmp/$UBUNTU_IMAGE
+}
+
+trap _signal_handler 1 2 3 15
+
 _git_root_dir()
 {
   pushd ${0%/*} > /dev/null
@@ -87,6 +94,10 @@ _setup()
 
   # multipass
   multipass set client.gui.autostart=false
+
+  test -x /usr/local/opt/curl/bin/curl && {
+      alias curl=/usr/local/opt/curl/bin/curl
+  }
 }
 
 _k3s_master_cloud_init()
@@ -139,6 +150,9 @@ _cluster()
 {
   NODES="$(eval "echo node{1..$NODE}")"
   MASTER_NODE=node1
+  test -e /tmp/${UBUNTU_IMAGE} || {
+      curl -L -o /tmp/${UBUNTU_IMAGE} http://ubuntutym2.u-toyama.ac.jp/cloud-images/releases/18.04/release/${UBUNTU_IMAGE}
+  }
 
   for node in ${NODES}
   do
@@ -147,9 +161,11 @@ _cluster()
     }
     if [ $node = "$MASTER_NODE" ]
     then
+
       # til multipass v1.1.0
       #multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
       _k3s_master_cloud_init | multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init -
+
       multipass exec ${node} -- /bin/bash -c 'while [[ $(k3s kubectl get nodes $(hostname) --no-headers 2>/dev/null | grep -c -w "Ready") -ne 1 ]]; do echo -n .; sleep 3; done; echo' < /dev/null
 
       K3S_NODEIP_MASTER="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
@@ -158,6 +174,7 @@ _cluster()
     else
       K3S_TOKEN="$(multipass exec $MASTER_NODE -- /bin/bash -c "sudo cat /var/lib/rancher/k3s/server/node-token" < /dev/null)"
       K3S_URL="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
+
       # til multipass v1.1.0
       #multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init <(_k3s_worker_cloud_init)
       _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init -
@@ -284,6 +301,9 @@ export KUBECONFIG=$(_git_root_dir)/run/k3s.yaml
 while getopts "c:m:d:n:vh" option
 do
   case "$option" in
+    v)
+      set -x
+      ;;
     c)
       CPU=$OPTARG
       ;;
