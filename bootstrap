@@ -94,10 +94,6 @@ _setup()
 
   # multipass
   multipass set client.gui.autostart=false
-
-  test -x /usr/local/opt/curl/bin/curl && {
-      alias curl=/usr/local/opt/curl/bin/curl
-  }
 }
 
 _k3s_master_cloud_init()
