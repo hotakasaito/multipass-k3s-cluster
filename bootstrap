@@ -2,11 +2,21 @@
 
 set -eo pipefail
 
+_clean()
+{
+  for file in /tmp/master-cloud-init.$$ /tmp/worker-cloud-init.$$
+  do
+    test -e $file && rm -f $file
+  done
+}
+
+trap '_clean ; exit 1' 1 2 3 15
+
 _usage()
 {
   cat <<EOF
 Usage:
-  ${0##*/} -h [-c|-m|-d|-n num] (all|cluster|helm|cert|kong|registry|exlb|test|terminate)
+  ${0##*/} -v -h [-c|-m|-d|-n num] (all|cluster|helm|cert|kong|registry|exlb|test|terminate)
 
 Commands:
   all        all
@@ -19,12 +29,15 @@ Commands:
   test       for private registry
   terminate  purge all vms
 
+Flags:
+  -v         verbose mode
+  -h         show this message
+
 Flags: valid only for cluster command
   -c         cpu (default: $CPU)
   -m         memory (default: $MEM)
   -d         disk (default: $DISK)
   -n         node (default: $NODE)
-  -h         show this message
 
 EOF
   exit 2
@@ -62,7 +75,7 @@ _check_multipass()
 _setup()
 {
   test -d $(_git_root_dir)/run || mkdir $(_git_root_dir)/run
-  for c in jq helm stern iproute2mac
+  for c in jq helm stern iproute2mac aria2 parallel
   do
     brew list $c > /dev/null 2>&1 || brew install $c
   done
@@ -71,6 +84,9 @@ _setup()
   then
     curl -sfSL https://dl.k8s.io/${KUBECTL_VERSION}/kubernetes-client-darwin-amd64.tar.gz | tar xvzf - -C /usr/local/bin --strip=3 - kubernetes/client/bin/kubectl
   fi
+
+  # multipass
+  multipass set client.gui.autostart=false
 }
 
 _k3s_master_cloud_init()
@@ -79,7 +95,7 @@ _k3s_master_cloud_init()
   cat << EOF
 #cloud-config
 runcmd:
- - '\curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy=traefik --tls-san ${EXTERNAL_IP}'
+ - '\curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy servicelb --no-deploy traefik --no-deploy metrics-server --no-flannel --tls-san ${EXTERNAL_IP}'
 EOF
 }
 
@@ -131,20 +147,23 @@ _cluster()
     }
     if [ $node = "$MASTER_NODE" ]
     then
-      multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
+      # til multipass v1.1.0
+      #multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
+      _k3s_master_cloud_init | multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init -
       multipass exec ${node} -- /bin/bash -c 'while [[ $(k3s kubectl get nodes $(hostname) --no-headers 2>/dev/null | grep -c -w "Ready") -ne 1 ]]; do echo -n .; sleep 3; done; echo' < /dev/null
 
       K3S_NODEIP_MASTER="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
-      #multipass exec $MASTER_NODE -- bash -c "cat /etc/rancher/k3s/k3s.yaml" > $(_git_root_dir)/run/k3s.yaml
       multipass transfer ${MASTER_NODE}:/etc/rancher/k3s/k3s.yaml $(_git_root_dir)/run/k3s.yaml
       sed -i'.back' -e s,https://127.0.0.1:6443,${K3S_NODEIP_MASTER},g $(_git_root_dir)/run/k3s.yaml
     else
       K3S_TOKEN="$(multipass exec $MASTER_NODE -- /bin/bash -c "sudo cat /var/lib/rancher/k3s/server/node-token" < /dev/null)"
       K3S_URL="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
-      multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init <(_k3s_worker_cloud_init)
+      # til multipass v1.1.0
+      #multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init <(_k3s_worker_cloud_init)
+      _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init -
     fi
 
-    multipass exec ${node} -- sudo sed -i -e 's/^#\?DNS=.*/DNS=1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4/' /etc/systemd/resolved.conf
+    multipass exec ${node} -- sudo sed -i -e 's/^#\?DNS=.*/DNS=8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1/' /etc/systemd/resolved.conf
     multipass exec ${node} -- sudo systemctl restart systemd-resolved
     multipass exec ${node} -- systemd-resolve --status
     multipass exec ${node} -- sudo iptables -P FORWARD ACCEPT
@@ -214,7 +233,7 @@ _exlb()
   docker container rm --force nginx-lb || true
   # `--sysctl net.ipv4.ip_nonlocal_bind=1`は不要
   # https://stackoverflow.com/questions/3191509/nginx-error-99-cannot-assign-requested-address
-  docker run -d --sysctl net.ipv4.ip_nonlocal_bind=1 --name nginx-lb --restart=always -p 80:80 -p 443:443 -v $(git_root_dir)/run/nginx.conf:/etc/nginx/nginx.conf nginx:1.14
+  docker run -d --sysctl net.ipv4.ip_nonlocal_bind=1 --name nginx-lb --restart=always -p 80:80 -p 443:443 -v $(git_root_dir)/run/nginx.conf:/etc/nginx/nginx.conf nginx:1.17
 }
 
 _test()
@@ -249,7 +268,7 @@ _terminate()
 
 # vars
 LANG=C
-MULTIPASS_VER=1.1.0
+MULTIPASS_VER=1.2.0
 CERT_MANAGER_VER=0.12.0
 MASTER_CPU=1
 MASTER_MEM=1
@@ -262,7 +281,7 @@ KUBECTL_VERSION=v1.17.0
 export KUBECONFIG=$(_git_root_dir)/run/k3s.yaml
 
 # main
-while getopts "c:m:d:n:h" option
+while getopts "c:m:d:n:vh" option
 do
   case "$option" in
     c)
@@ -276,6 +295,9 @@ do
       ;;
     n)
       NODE=$OPTARG
+      ;;
+    v)
+      set -evxET
       ;;
     h)
       _usage
