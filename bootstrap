@@ -340,6 +340,7 @@ case "$1" in
     _kong
     _registry
     _exlb
+    _test
     ;;
   cluster)
     _check_multipass
@@ -360,6 +361,9 @@ case "$1" in
     ;;
   exlb)
     _exlb
+    ;;
+  test)
+    _test
     ;;
   terminate)
     _terminate
