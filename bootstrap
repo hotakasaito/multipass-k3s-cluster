@@ -233,6 +233,34 @@ EOB
   fi
 }
 
+
+_nginx-lb-conf()
+{
+  KONG_PROXY_IP=$(kubectl get nodes --namespace kong -o jsonpath='{.items[0].status.addresses[0].address}'):$(kubectl get svc --namespace kong kong-kong-proxy -o jsonpath='{.spec.ports[0].nodePort}')
+    cat <<EOF
+worker_processes 4;
+worker_rlimit_nofile 40000;
+events {
+    worker_connections 8192;
+}
+stream {
+    upstream kong_servers {
+        least_conn;
+        server $KONG_PROXY_IP max_fails=3 fail_timeout=5s;
+    }
+    server {
+        listen      80;
+        proxy_pass  kong_servers;
+    }
+    server {
+        listen      443;
+        proxy_pass  kong_servers;
+        proxy_ssl on;
+    }
+}
+EOF
+}
+
 # sub commands
 _cluster()
 {
@@ -350,7 +378,7 @@ EOF
 _exlb()
 {
   NGINX_CONF=$(_git_root_dir)/run/nginx.conf
-  nginx-lb-conf > $NGINX_CONF
+  _nginx-lb-conf > $NGINX_CONF
   docker container rm --force nginx-lb || true
   # `--sysctl net.ipv4.ip_nonlocal_bind=1`は不要
   # https://stackoverflow.com/questions/3191509/nginx-error-99-cannot-assign-requested-address
