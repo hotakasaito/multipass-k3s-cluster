@@ -349,12 +349,12 @@ EOF
 
 _exlb()
 {
-  NGINX_CONF=$(git_root_dir)/run/nginx.conf
+  NGINX_CONF=$(_git_root_dir)/run/nginx.conf
   nginx-lb-conf > $NGINX_CONF
   docker container rm --force nginx-lb || true
   # `--sysctl net.ipv4.ip_nonlocal_bind=1`は不要
   # https://stackoverflow.com/questions/3191509/nginx-error-99-cannot-assign-requested-address
-  docker run -d --sysctl net.ipv4.ip_nonlocal_bind=1 --name nginx-lb --restart=always -p 80:80 -p 443:443 -v $(git_root_dir)/run/nginx.conf:/etc/nginx/nginx.conf nginx:1.17
+  docker run -d --sysctl net.ipv4.ip_nonlocal_bind=1 --name nginx-lb --restart=always -p 80:80 -p 443:443 -v $(_git_root_dir)/run/nginx.conf:/etc/nginx/nginx.conf nginx:1.17
 }
 
 _test()
