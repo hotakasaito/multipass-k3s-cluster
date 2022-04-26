@@ -3,3 +3,5 @@
 /tmp
 /run/*
 !/run/.gitkeep
+
+/config/tiller-service-account.yaml

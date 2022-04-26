@@ -2,6 +2,14 @@
 
 set -eo pipefail
 
+trap '_clean ; exit 1' 1 2 3 15
+trap _signal_handler 1 2 3 15
+
+_signal_handler()
+{
+    test -e /tmp/$UBUNTU_IMAGE && rm -f /tmp/$UBUNTU_IMAGE
+}
+
 _clean()
 {
   for file in /tmp/master-cloud-init.$$ /tmp/worker-cloud-init.$$
@@ -9,8 +17,6 @@ _clean()
     test -e $file && rm -f $file
   done
 }
-
-trap '_clean ; exit 1' 1 2 3 15
 
 _usage()
 {
@@ -43,13 +49,6 @@ EOF
   exit 2
 }
 
-_signal_handler()
-{
-    test -e /tmp/$UBUNTU_IMAGE && rm -f /tmp/$UBUNTU_IMAGE
-}
-
-trap _signal_handler 1 2 3 15
-
 _git_root_dir()
 {
   pushd ${0%/*} > /dev/null
@@ -61,7 +60,7 @@ _git_root_dir()
 _check_multipass()
 {
   brew cask list multipass > /dev/null 2>&1 && brew cask uninstall multipass
-  which multipass > /dev/null && (multipass version | grep -E "^multipass\s+${MULTIPASS_VER}" > /dev/null) && return
+  command -v multipass > /dev/null && (multipass version | grep -E "^multipass\s+${MULTIPASS_VER}" > /dev/null) && return
 
   pushd /tmp
   case $MULTIPASS_VER in
@@ -102,7 +101,7 @@ _k3s_master_cloud_init()
   cat << EOF
 #cloud-config
 runcmd:
- - '\curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s - --node-taint node-role.kubernetes.io/master=effect:NoSchedule --no-deploy servicelb --no-deploy traefik --no-deploy metrics-server --no-flannel --tls-san ${EXTERNAL_IP}'
+ - '\curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -s -
 EOF
 }
 
@@ -157,9 +156,6 @@ _cluster()
     }
     if [ $node = "$MASTER_NODE" ]
     then
-
-      # til multipass v1.1.0
-      #multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init <(_k3s_master_cloud_init)
       _k3s_master_cloud_init | multipass launch --name ${node} --cpus $MASTER_CPU --mem ${MASTER_MEM}G --disk ${MASTER_DISK}G --cloud-init -
 
       multipass exec ${node} -- /bin/bash -c 'while [[ $(k3s kubectl get nodes $(hostname) --no-headers 2>/dev/null | grep -c -w "Ready") -ne 1 ]]; do echo -n .; sleep 3; done; echo' < /dev/null
@@ -171,8 +167,6 @@ _cluster()
       K3S_TOKEN="$(multipass exec $MASTER_NODE -- /bin/bash -c "sudo cat /var/lib/rancher/k3s/server/node-token" < /dev/null)"
       K3S_URL="https://$(multipass info $MASTER_NODE --format json | jq -r .info.$MASTER_NODE.ipv4[0]):6443"
 
-      # til multipass v1.1.0
-      #multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init <(_k3s_worker_cloud_init)
       _k3s_worker_cloud_init | multipass launch --name ${node} --cpus $CPU --mem ${MEM}G --disk ${DISK}G --cloud-init -
     fi
 
@@ -187,7 +181,28 @@ _helm()
 {
   kubectl -n kube-system get serviceaccount tiller > /dev/null 2>&1 || {
     kubectl -n kube-system create serviceaccount tiller
-    kubectl create clusterrolebinding tiller --clusterrole=cluster-admin --serviceaccount=kube-system:tiller
+    #kubectl create clusterrolebinding tiller --clusterrole=cluster-admin --serviceaccount=kube-system:tiller
+    cat <<EOF | kubectl apply -f -
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: helm
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: tiller
+  namespace: kube-system
+EOF
   }
   curl -sfSL https://git.io/get_helm.sh | sh -
   helm init --service-account tiller
@@ -196,17 +211,11 @@ _helm()
 
 _cert()
 {
-  kubectl apply -f https://raw.githubusercontent.com/jetstack/cert-manager/release-0.9/deploy/manifests/00-crds.yaml
-  kubectl create namespace cert-manager
-  kubectl label namespace cert-manager certmanager.k8s.io/disable-validation=true
-  helm repo add jetstack https://charts.jetstack.io
-  helm repo update
-  helm install \
-       --name cert-manager \
-       --namespace cert-manager \
-       --version v$CERT_MANAGER_VER \
-       jetstack/cert-manager
-  kubectl -n cert-manager rollout status deploy/cert-manager
+  kubectl -n cert-manager get service cert-manager > /dev/null || {
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.8.0/cert-manager.yaml
+    kubectl label namespace cert-manager certmanager.k8s.io/disable-validation=true
+    kubectl -n cert-manager rollout status deploy/cert-manager
+  }
 }
 
 _kong()
@@ -220,11 +229,13 @@ _kong()
 _registry()
 {
   _check_insecure_settings
-  [ "$KUBE_ENGINE" = "k3s" ] && k3s_config
+  [ "$KUBE_ENGINE" = "k3s" ] && _k3s_config
+  export KUBECONFIG=$(_git_root_dir)/run/k3s.yaml
   # waiting for started system
   kubectl rollout status deployment tiller-deploy -n kube-system
 
-  helm install stable/docker-registry --wait --name docker-registry --set service.type=NodePort,service.nodePort=${REGISTRY_NODE_PORT}
+  helm repo add twuni https://helm.twun.io
+  helm install twuni/docker-registry --wait --name docker-registry --set service.type=NodePort,service.nodePort=${REGISTRY_NODE_PORT}
   PASSWORD=$(kubectl get secret docker-registry-secret --output="jsonpath={.data.haSharedSecret}" | base64 -D)
 
   export NODE_PORT=$(kubectl get --namespace default -o jsonpath="{.spec.ports[0].nodePort}" services docker-registry)
@@ -241,12 +252,12 @@ EOF
 
 _exlb()
 {
-  NGINX_CONF=$(git_root_dir)/run/nginx.conf
-  nginx-lb-conf > $NGINX_CONF
+  NGINX_CONF=$(_git_root_dir)/run/nginx.conf
+  _nginx-lb-conf > $NGINX_CONF
   docker container rm --force nginx-lb || true
   # `--sysctl net.ipv4.ip_nonlocal_bind=1`は不要
   # https://stackoverflow.com/questions/3191509/nginx-error-99-cannot-assign-requested-address
-  docker run -d --sysctl net.ipv4.ip_nonlocal_bind=1 --name nginx-lb --restart=always -p 80:80 -p 443:443 -v $(git_root_dir)/run/nginx.conf:/etc/nginx/nginx.conf nginx:1.17
+  docker run -d --sysctl net.ipv4.ip_nonlocal_bind=1 --name nginx-lb --restart=always -p 80:80 -p 443:443 -v $(_git_root_dir)/run/nginx.conf:/etc/nginx/nginx.conf nginx:1.17
 }
 
 _test()
@@ -279,19 +290,114 @@ _terminate()
   multipass delete --purge --all || true
 }
 
+_get_node_ips() {
+  multipass list --format json | jq -r .list[].ipv4[] | sort
+}
+
+_get_nodes() {
+  multipass list --format json | jq -r .list[].name | sort
+}
+
+_gen_config_toml_tmpl() {
+  cat <<EOF
+[plugins.opt]
+path = "{{ .NodeConfig.Containerd.Opt }}"
+[plugins.cri]
+stream_server_address = "{{ .NodeConfig.AgentConfig.NodeName }}"
+stream_server_port = "10010"
+{{- if .IsRunningInUserNS }}
+disable_cgroup = true
+disable_apparmor = true
+restrict_oom_score_adj = true
+{{ end -}}
+{{- if .NodeConfig.AgentConfig.PauseImage }}
+sandbox_image = "{{ .NodeConfig.AgentConfig.PauseImage }}"
+{{ end -}}
+{{- if not .NodeConfig.NoFlannel }}
+  [plugins.cri.cni]
+    bin_dir = "{{ .NodeConfig.AgentConfig.CNIBinDir }}"
+    conf_dir = "{{ .NodeConfig.AgentConfig.CNIConfDir }}"
+{{ end -}}
+[plugins.cri.containerd.runtimes.runc]
+  runtime_type = "io.containerd.runc.v2"
+
+# Added section: additional registries and the endpoints
+[plugins.cri.registry.mirrors]
+  [plugins.cri.registry.mirrors."docker.io"]
+    endpoint = ["https://registry-1.docker.io"]
+EOF
+  for ip in $(_get_node_ips)
+  do
+    cat <<EOF
+  [plugins.cri.registry.mirrors."${ip}:${REGISTRY_NODE_PORT}"]
+    endpoint = ["http://${ip}:${REGISTRY_NODE_PORT}"]
+EOF
+  done
+}
+
+_k3s_config() {
+  tmp_config=/tmp/config.$$
+  _gen_config_toml_tmpl > $tmp_config
+  for node in $(_get_nodes)
+  do
+    cat $tmp_config | multipass exec $node -- sudo tee /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+    if [ $node = "node1" ]
+    then
+      multipass exec $node -- sudo sh -c "systemctl stop k3s-agent ; systemctl stop k3s && sleep 3 && systemctl start k3s"
+    else
+      multipass exec $node -- sudo systemctl restart k3s-agent
+    fi
+    while ! $(multipass info $node > /dev/null)
+    do
+      sleep 1
+    done
+  done
+}
+
+_nginx-lb-conf() {
+  TRAEFIK_PROXY_IP=$(kubectl get nodes --namespace kube-system -o jsonpath='{.items[0].status.addresses[0].address}'):$(kubectl get svc --namespace kube-system traefik -o jsonpath='{.spec.ports[0].nodePort}')
+  cat <<EOF
+worker_processes 4;
+worker_rlimit_nofile 40000;
+
+events {
+    worker_connections 8192;
+}
+
+stream {
+    upstream traefik_servers {
+        least_conn;
+        server $TRAEFIK_PROXY_IP max_fails=3 fail_timeout=5s;
+    }
+    server {
+        listen      80;
+        proxy_pass  traefik_servers;
+    }
+
+    server {
+        listen      443;
+        proxy_pass  traefik_servers;
+        proxy_ssl on;
+    }
+}
+EOF
+}
+
 # vars
+KUBE_ENGINE=k3s
 LANG=C
-MULTIPASS_VER=1.2.0
-CERT_MANAGER_VER=0.12.0
+MULTIPASS_VER=1.8.0
+CERT_MANAGER_VER=1.8.0
 MASTER_CPU=1
 MASTER_MEM=1
-MASTER_DISK=1
+MASTER_DISK=10
 CPU=2
 MEM=4
-DISK=5
+DISK=10
 NODE=3
 KUBECTL_VERSION=v1.17.0
 export KUBECONFIG=$(_git_root_dir)/run/k3s.yaml
+REGISTRY_NODE_PORT=32124
 
 # main
 while getopts "c:m:d:n:vh" option
@@ -333,7 +439,6 @@ case "$1" in
     _cluster
     _helm
     _cert
-    _kong
     _registry
     _exlb
     _test
