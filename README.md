@@ -59,8 +59,16 @@ Flags: valid only for cluster command
 
 # Kubernetes
 ## Samples
-1. echoserver
+1. echoserver service
 > ```bash
 > $ export KUBECONFIG=$PWD/run/k3s.yaml
 > $ kubectl apply -f samples/echoserver.yaml
+> ```
+
+2. docker image push
+> ```bash
+> $ docker image pull nginx:1.17
+> $ DOCKER_REGUSTRY_IP=$(multipass ls --format json | jq -r '[.list[].ipv4[] | select(test("^192\\.168\\."))][0]')
+> $ docker image tag nginx:1.17 ${DOCKER_REGUSTRY_IP}:32124/nginx:1.17
+> $ docker image push ${DOCKER_REGUSTRY_IP}:32124/nginx:1.17
 > ```
