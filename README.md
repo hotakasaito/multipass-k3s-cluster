@@ -56,3 +56,11 @@ Flags: valid only for cluster command
   -n         node (default: 3)
   -h         show this message
 ```
+
+# Kubernetes
+## Samples
+1. echoserver
+> ```bash
+> $ export KUBECONFIG=$PWD/run/k3s.yaml
+> $ kubectl apply -f samples/echoserver.yaml
+> ```
